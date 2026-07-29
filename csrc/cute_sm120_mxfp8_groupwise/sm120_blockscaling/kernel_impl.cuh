@@ -663,6 +663,20 @@ struct SM120BlockScalingGemmKernel {
       }
       cutlass::arch::fence_barrier_init();
     }
+
+    constexpr bool kUseZpSmemTable =
+        kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
+    __shared__ int32_t zp_tile_cumsum_smem[kUseZpSmemTable ? Scheduler::kMaxSmemGroups + 1 : 1];
+    int32_t const* zp_tile_cumsum = nullptr;
+    if constexpr (kUseZpSmemTable) {
+      if (params.num_experts <= Scheduler::kMaxSmemGroups) {
+        if (warp_idx == 1) {
+          Scheduler::init_zero_padding_smem(params.grouped_layout, params.num_experts,
+                                            zp_tile_cumsum_smem);
+        }
+        zp_tile_cumsum = zp_tile_cumsum_smem;
+      }
+    }
     __syncthreads();
 
     int32_t k_tile_count = sm120_common::math::ceil_div(params.K, int(KT::kTileK));
@@ -679,7 +693,8 @@ struct SM120BlockScalingGemmKernel {
         uint32_t ab_phase = 1;
         uint32_t store_phase = 1;
         if (lane_predicate) {
-          Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
+          Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout,
+                              zp_tile_cumsum);
           int32_t m_block_idx, n_block_idx;
           while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
             auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
@@ -693,7 +708,8 @@ struct SM120BlockScalingGemmKernel {
         int sf_stage = 0;
         uint32_t sf_phase = 1;
         uint32_t store_phase = 1;
-        Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
+        Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout,
+                              zp_tile_cumsum);
         int32_t m_block_idx, n_block_idx;
         while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
           auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
@@ -713,7 +729,8 @@ struct SM120BlockScalingGemmKernel {
             uint32_t sf_phase[KT::TmaStoreConfig::StagesD] = {0};
             int epi_stage = 0;
             if (lane_predicate) {
-              Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
+              Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout,
+                              zp_tile_cumsum);
               int32_t m_block_idx, n_block_idx;
               while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
                 auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
@@ -728,7 +745,8 @@ struct SM120BlockScalingGemmKernel {
             uint32_t full_phase = 0;
             int store_stage = 0;
             int store_thread_idx = cutlass::canonical_lane_idx();
-            Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
+            Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout,
+                              zp_tile_cumsum);
             int32_t m_block_idx, n_block_idx;
             while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
               auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(
@@ -753,7 +771,8 @@ struct SM120BlockScalingGemmKernel {
       for (int i = 0; i < KT::TmaStoreConfig::StagesD; ++i) {
         se_phase[i] = 1;
       }
-      Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout);
+      Scheduler scheduler(params.M, params.N, params.num_experts, params.grouped_layout,
+                              zp_tile_cumsum);
       int32_t m_block_idx, n_block_idx;
       while (scheduler.get_next_block(m_block_idx, n_block_idx)) {
         auto blk_coord = sm120_common::utils::make_blk_coord<KT::kSwapAB>(

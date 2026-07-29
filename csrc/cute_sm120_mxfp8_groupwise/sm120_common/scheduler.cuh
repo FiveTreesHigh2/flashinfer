@@ -84,11 +84,17 @@ struct Scheduler {
 
   static constexpr int kNum1DBlocksPerGroup = get_num_1d_blocks_per_group<BlockM, BlockN>();
 
+  // Max group count for the smem tile-cumsum fast path of
+  // MGroupedContiguousWithZeroPadding; larger group counts fall back to the
+  // legacy linear scan.
+  static constexpr int kMaxSmemGroups = 512;
+
   int32_t shape_m;
   int32_t shape_n;
   int32_t num_groups;
   int32_t num_n_blocks;
   int32_t const* grouped_layout;
+  int32_t const* zp_tile_cumsum = nullptr;
 
   int32_t current_iter = -1;
   int32_t current_group_idx = 0;
@@ -98,18 +104,55 @@ struct Scheduler {
   int32_t num_m_blocks = 0;
 
   __device__ __forceinline__ explicit Scheduler(int shape_m_, int shape_n_, int num_groups_,
-                                                int32_t const* grouped_layout_ = nullptr)
+                                                int32_t const* grouped_layout_ = nullptr,
+                                                int32_t const* zp_tile_cumsum_ = nullptr)
       : shape_m(shape_m_),
         shape_n(shape_n_),
         num_groups(num_groups_),
         num_n_blocks((shape_n_ + BlockN - 1) / BlockN),
-        grouped_layout(grouped_layout_) {
+        grouped_layout(grouped_layout_),
+        zp_tile_cumsum(zp_tile_cumsum_) {
     if constexpr (kGemmType == GemmType::Normal || kGemmType == GemmType::Batched ||
                   kGemmType == GemmType::MGroupedContiguous) {
       num_m_blocks = (shape_m_ + BlockM - 1) / BlockM;
     } else if constexpr (kGemmType == GemmType::MGroupedContiguousWithPsumLayout) {
       current_psum_m = grouped_layout[0];
       num_m_blocks = (current_psum_m + BlockM - 1) / BlockM;
+    }
+  }
+
+  // Cooperative one-warp init for the ZeroPadding fast path: computes the
+  // exclusive prefix sum of per-group m-block counts into
+  // tile_cumsum[0..num_groups] (tile_cumsum[num_groups] = total m blocks).
+  // Must be called by exactly one full warp; the caller is responsible for a
+  // block-level barrier before any thread constructs a Scheduler with the
+  // table. Requires num_groups <= kMaxSmemGroups.
+  static __device__ __forceinline__ void init_zero_padding_smem(int32_t const* grouped_layout,
+                                                                int32_t num_groups,
+                                                                int32_t* tile_cumsum) {
+    int lane = int(threadIdx.x) & 31;
+    int chunk = (num_groups + 31) / 32;
+    int begin = lane * chunk;
+    int end = (begin + chunk < num_groups) ? (begin + chunk) : num_groups;
+    int32_t local_sum = 0;
+    for (int g = begin; g < end; ++g) {
+      int32_t rows = grouped_layout[g + 1] - grouped_layout[g];
+      local_sum += (rows + BlockM - 1) / BlockM;
+    }
+    int32_t scan = local_sum;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+      int32_t up = __shfl_up_sync(0xffffffff, scan, d);
+      if (lane >= d) scan += up;
+    }
+    int32_t running = scan - local_sum;
+    for (int g = begin; g < end; ++g) {
+      tile_cumsum[g] = running;
+      int32_t rows = grouped_layout[g + 1] - grouped_layout[g];
+      running += (rows + BlockM - 1) / BlockM;
+    }
+    if (begin < num_groups && end == num_groups) {
+      tile_cumsum[num_groups] = running;
     }
   }
 
@@ -170,6 +213,32 @@ struct Scheduler {
       // ZeroPadding MoE: unpadded raw grouped_layout interpreted as
       // token_offset[E+1] int32 cumsum WITH leading 0 (= [0, m0, m0+m1, ..., M_total]),
       // plain row-major (no L2 swizzle).
+      if (zp_tile_cumsum != nullptr) {
+        // Fast path: zp_tile_cumsum[g] = m blocks before group g (exclusive
+        // prefix sum, see init_zero_padding_smem). Same tile enumeration order
+        // as the linear scan below; empty groups have zero-width cumsum spans
+        // and are skipped by the search for free.
+        int32_t total_m_blocks = zp_tile_cumsum[num_groups];
+        if (next_block_idx >= int64_t(total_m_blocks) * num_n_blocks) return false;
+        int32_t q = int32_t(next_block_idx / num_n_blocks);
+        n_block_idx = int32_t(next_block_idx % num_n_blocks);
+        // First j in [1, num_groups] with zp_tile_cumsum[j] > q; the invariant
+        // zp_tile_cumsum[num_groups] > q holds after the bound check above.
+        int32_t lo = 1, hi = num_groups;
+        while (lo < hi) {
+          int32_t mid = (lo + hi) >> 1;
+          if (zp_tile_cumsum[mid] > q) {
+            hi = mid;
+          } else {
+            lo = mid + 1;
+          }
+        }
+        current_group_idx = lo - 1;
+        prev_psum_m = grouped_layout[current_group_idx];
+        current_psum_m = grouped_layout[current_group_idx + 1];
+        m_block_idx = q - zp_tile_cumsum[current_group_idx];
+        return true;
+      }
       while (true) {
         if (current_group_idx >= num_groups) return false;
 

@@ -140,6 +140,28 @@ def test_moe_gemm_fp8_nt_groupwise_irregular(m_per_expert_list):
 
 
 @pytest.mark.parametrize(
+    "active_rows",
+    [
+        {3: 1, 40: 1, 77: 1, 114: 1, 151: 1, 188: 1, 225: 1, 255: 1},
+        {0: 2, 17: 1, 130: 3, 254: 2},
+    ],
+    ids=["decode_bs1_topk8", "decode_skewed"],
+)
+def test_moe_gemm_fp8_nt_groupwise_many_experts_sparse(active_rows):
+    """Decode-shaped routing: few rows scattered across 256 experts, most empty.
+
+    Exercises the smem tile-cumsum scheduler fast path (num_groups > 8 with
+    mostly zero-width groups)."""
+    skip_if_not_sm120()
+    num_experts = 256
+    m_per_expert_list = [active_rows.get(i, 0) for i in range(num_experts)]
+    a, b, a_scale, b_scale, m_indptr, ref = make_inputs(m_per_expert_list, 1024, 2048)
+    out = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr)
+    diff = calc_diff(out.float(), ref.float())
+    assert diff < CALC_DIFF_THRESHOLD, f"calc_diff={diff:.6e}"
+
+
+@pytest.mark.parametrize(
     "bad_input",
     [
         "granularity",
