@@ -133,10 +133,23 @@ struct SM120BlockScalingGemmKernel {
                                             typename KT::TensorStorageUnion>>;
   using BarrierStorage = typename KT::BarrierStorage;
 
-  struct SharedStorage {
+  // The tile-cumsum table lives inside the dynamic SharedStorage: a static
+  // __shared__ array would be placed before the dynamic smem region and break
+  // the 128B alignment TMA requires for TensorStorage.
+  static constexpr bool kUseZpSmemTable =
+      kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
+
+  struct SharedStorageBase {
     TensorStorage tensors;
     alignas(16) BarrierStorage barriers;
   };
+  struct SharedStorageWithZpTable {
+    TensorStorage tensors;
+    alignas(16) BarrierStorage barriers;
+    alignas(16) int32_t zp_tile_cumsum[Scheduler::kMaxSmemGroups + 1];
+  };
+  using SharedStorage =
+      std::conditional_t<kUseZpSmemTable, SharedStorageWithZpTable, SharedStorageBase>;
 
   static constexpr int kSmemSize = int(sizeof(SharedStorage));
 
@@ -664,17 +677,14 @@ struct SM120BlockScalingGemmKernel {
       cutlass::arch::fence_barrier_init();
     }
 
-    constexpr bool kUseZpSmemTable =
-        kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
-    __shared__ int32_t zp_tile_cumsum_smem[kUseZpSmemTable ? Scheduler::kMaxSmemGroups + 1 : 1];
     int32_t const* zp_tile_cumsum = nullptr;
     if constexpr (kUseZpSmemTable) {
       if (params.num_experts <= Scheduler::kMaxSmemGroups) {
         if (warp_idx == 1) {
           Scheduler::init_zero_padding_smem(params.grouped_layout, params.num_experts,
-                                            zp_tile_cumsum_smem);
+                                            shared_storage.zp_tile_cumsum);
         }
-        zp_tile_cumsum = zp_tile_cumsum_smem;
+        zp_tile_cumsum = shared_storage.zp_tile_cumsum;
       }
     }
     __syncthreads();
