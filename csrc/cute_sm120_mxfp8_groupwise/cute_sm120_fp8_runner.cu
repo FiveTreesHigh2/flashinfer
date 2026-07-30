@@ -340,14 +340,21 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
                               int num_experts, int total_rows, int shape_n, int shape_k,
                               cudaStream_t stream, float const* SFA, float const* SFB,
                               int scale_granularity_m, int scale_granularity_n,
-                              int scale_granularity_k, bool is_gated) {
+                              int scale_granularity_k, bool is_gated, float* finalize_out,
+                              int32_t const* finalize_dst2token,
+                              float const* finalize_row_weights) {
   check_scale_granularity_mnk(scale_granularity_m, scale_granularity_n, scale_granularity_k);
   if (is_gated) {
+    if (finalize_out != nullptr) {
+      throw std::runtime_error(
+          "moe_gemm finalize fusion is not supported together with is_gated");
+    }
     fused_moe_fp8_nt_groupwise_impl(D, A, B, token_offset, num_experts, total_rows, shape_n,
                                     shape_k, stream, SFA, SFB);
   } else {
     moe_gemm_fp8_nt_groupwise_impl(D, A, B, token_offset, num_experts, total_rows, shape_n, shape_k,
-                                   stream, SFA, SFB);
+                                   stream, SFA, SFB, finalize_out, finalize_dst2token,
+                                   finalize_row_weights);
   }
 }
 
@@ -357,7 +364,11 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
     moe_gemm_fp8_nt_groupwise_impl(void* D, void const* A, void const* B,
                                    int32_t const* token_offset, int num_experts, int total_rows,
                                    int shape_n, int shape_k, cudaStream_t stream, float const* SFA,
-                                   float const* SFB) {
+                                   float const* SFB, float* finalize_out,
+                                   int32_t const* finalize_dst2token,
+                                   float const* finalize_row_weights) {
+  sm120_blockscaling::MoeFinalizeArgs finalize{finalize_out, finalize_dst2token,
+                                               finalize_row_weights};
   constexpr auto kGT = sm120_common::GemmType::MGroupedContiguousWithZeroPadding;
   using KT_M32 = sm120_blockscaling::SM120BlockScalingBuilder<32, 128, 128, 2, 1, 128, 128, kGT>;
   using KT_M64 = sm120_blockscaling::SM120BlockScalingBuilder<64, 128, 128, 2, 1, 128, 128, kGT>;
@@ -382,11 +393,21 @@ void CuteSm120Fp8GemmRunner<ElementType, OutElementType, AccumElementType, Block
   int64_t swapab_tiles = tile_count(8, 128);
   int64_t m32_tiles = tile_count(32, 128);
 
-  if (shape_n % 128 == 0 &&
-      (m_per_expert <= 8 || (m32_tiles < num_sms / 2 && swapab_tiles <= num_sms))) {
+  bool use_swapab = shape_n % 128 == 0 &&
+                    (m_per_expert <= 8 || (m32_tiles < num_sms / 2 && swapab_tiles <= num_sms));
+  if (finalize.out != nullptr && !use_swapab) {
+    // The FINALIZE fusion lives in the SwapAB pred-stg epilogue only; refuse
+    // loudly rather than silently dropping the fusion (callers mirror the
+    // tile rule and should not request it here).
+    throw std::runtime_error(
+        "moe_gemm finalize fusion requires the SwapAB tile path "
+        "(m_per_expert <= 8 or under-filled flat work, n % 128 == 0)");
+  }
+
+  if (use_swapab) {
     sm120_blockscaling::launch_moe_gemm<KT_SWAPAB_N8>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                       total_rows, shape_n, shape_k, num_experts,
-                                                      token_offset, num_sms, stream);
+                                                      token_offset, num_sms, stream, finalize);
   } else if (m_per_expert <= 32) {
     sm120_blockscaling::launch_moe_gemm<KT_M32>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, total_rows,
                                                 shape_n, shape_k, num_experts, token_offset,

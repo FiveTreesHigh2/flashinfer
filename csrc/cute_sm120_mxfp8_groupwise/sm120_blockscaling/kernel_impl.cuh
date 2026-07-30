@@ -61,6 +61,14 @@ struct SM120BlockScalingGemmKernel {
     int K;
     int num_experts;
     int32_t const* grouped_layout;
+    // Optional FINALIZE fusion (ZeroPadding MoE + SwapAB pred-stg epilogue
+    // only): when out_finalize != nullptr the epilogue adds each packed row
+    // (scaled by row_weights[row]) into out_finalize[dst2token[row], N] via
+    // fp32 atomics instead of storing ptr_D; dst2token < 0 rows are skipped
+    // (CUDA-graph -1 padding).
+    float* out_finalize = nullptr;
+    int32_t const* dst2token = nullptr;
+    float const* row_weights = nullptr;
   };
 
   struct Arguments {
@@ -73,6 +81,9 @@ struct SM120BlockScalingGemmKernel {
     typename KT::ElementD* ptr_D;
     int32_t const* grouped_layout;
     typename KT::TmaStoreConfig::StrideD dD = {};
+    float* out_finalize = nullptr;
+    int32_t const* dst2token = nullptr;
+    float const* row_weights = nullptr;
   };
 
   static Params to_underlying_arguments(ProblemShape const& problem_shape, Arguments const& args) {
@@ -106,7 +117,10 @@ struct SM120BlockScalingGemmKernel {
             N,
             K,
             num_experts,
-            args.grouped_layout};
+            args.grouped_layout,
+            args.out_finalize,
+            args.dst2token,
+            args.row_weights};
   }
 
   static dim3 get_grid_shape(int num_sms) { return dim3(num_sms, 1, 1); }

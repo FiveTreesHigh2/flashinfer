@@ -320,6 +320,49 @@ CUTE_DEVICE void epi_pred_stg(Params const& params, Accum const& accum, int thre
   }
 }
 
+// FINALIZE fusion for the SwapAB ZeroPadding MoE store: instead of writing the
+// packed [rows, N] buffer (later unpermuted+combined by a separate kernel),
+// scale each packed row by row_weights[row] and accumulate it into
+// out_finalize[dst2token[row], N] with fp32 atomics. Works on the raw fp32
+// accumulator (no bf16 round-trip); rows with dst2token < 0 (CUDA-graph -1
+// padding) are skipped. Caller zero-fills out_finalize.
+template <typename KT, typename Params, typename Accum, typename Barrier>
+CUTE_DEVICE void epi_pred_stg_finalize(Params const& params, Accum const& accum, int thread_idx,
+                                       int32_t m_offset, int32_t m_boundary, int32_t m_block_idx,
+                                       int32_t n_block_idx, Barrier* store_empty_mbar) {
+  static_assert(!KT::kFlat && KT::kSwapAB,
+                "epi_pred_stg_finalize supports the SwapAB MoE store only.");
+  typename KT::MMAConfig::TiledMma mma;
+
+  // SwapAB tile: dim0 spans the output N columns (kTileM), dim1 spans the
+  // packed rows of the current expert segment (kTileN).
+  auto cD = cute::make_identity_tensor(
+      cute::make_shape(cute::Int<KT::kTileM>{}, cute::Int<KT::kTileN>{}));
+  int32_t residue_M = m_boundary - m_offset;
+  auto residue = make_residue_coord<KT::kSwapAB>(residue_M, params.N, m_block_idx, n_block_idx,
+                                                 KT::kTileM, KT::kTileN);
+
+  auto thr_mma = mma.get_thread_slice(thread_idx);
+  auto tCcD = thr_mma.partition_C(cD);
+
+  store_empty_mbar[0].arrive();
+
+  CUTE_UNROLL
+  for (int i = 0; i < cute::size(accum); ++i) {
+    int m_in = cute::get<0>(tCcD(i));
+    int n_in = cute::get<1>(tCcD(i));
+    if (m_in < cute::get<0>(residue) && n_in < cute::get<1>(residue)) {
+      int32_t row = m_offset + n_block_idx * KT::kTileN + n_in;
+      int32_t token = params.dst2token[row];
+      if (token >= 0) {
+        int32_t col = m_block_idx * KT::kTileM + m_in;
+        float value = float(accum(i)) * params.row_weights[row];
+        atomicAdd(params.out_finalize + int64_t(token) * params.N + col, value);
+      }
+    }
+  }
+}
+
 template <typename KT, typename Params, typename SharedStorage, typename Accum, typename Barrier>
 CUTE_DEVICE void epi_pred_r2g(Params const& params, SharedStorage& shared_storage,
                               Accum const& accum, int thread_idx, int32_t m_offset,

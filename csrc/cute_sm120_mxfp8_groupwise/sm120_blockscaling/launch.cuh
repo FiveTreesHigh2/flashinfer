@@ -80,17 +80,28 @@ __forceinline__ void launch_kernel(typename Kernel::Params const& params, int nu
   CUTE_CHECK_ERROR(cudaGetLastError());
 }
 
+// Optional FINALIZE-fusion pointers for the ZeroPadding MoE store (SwapAB
+// pred-stg epilogue only); all-null means the plain packed store.
+struct MoeFinalizeArgs {
+  float* out = nullptr;
+  int32_t const* dst2token = nullptr;
+  float const* row_weights = nullptr;
+};
+
 template <typename KT>
 void launch_moe_gemm(typename KT::ElementA const* ptr_A, typename KT::ElementB const* ptr_B,
                      typename KT::ElementScale const* ptr_SFA,
                      typename KT::ElementScale const* ptr_SFB, typename KT::ElementD* ptr_D, int M,
                      int N, int K, int num_experts, int32_t const* grouped_layout, int num_sms,
-                     cudaStream_t stream = 0) {
+                     cudaStream_t stream = 0, MoeFinalizeArgs finalize = {}) {
   using Kernel =
       std::conditional_t<KT::kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding,
                          SM120BlockScalingMoeGemmKernel<KT>, SM120BlockScalingGemmKernel<KT>>;
   auto args =
       make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, M, N, K, grouped_layout);
+  args.out_finalize = finalize.out;
+  args.dst2token = finalize.dst2token;
+  args.row_weights = finalize.row_weights;
   auto problem_shape = make_shape(M, N, K, num_experts);
   launch_kernel<Kernel>(Kernel::to_underlying_arguments(problem_shape, args), num_sms, stream);
 }

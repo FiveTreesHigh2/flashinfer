@@ -456,8 +456,14 @@ struct SM120BlockScalingMoeGemmKernel : SM120BlockScalingGemmKernel<KT> {
                                               m_boundary, m_block_idx, epi_stage, se_phase[0],
                                               store_full_mbar, store_empty_mbar);
     } else if constexpr (KT::kSwapAB) {
-      sm120_common::utils::epi_pred_stg<KT>(params, accum, thread_idx, m_offset, m_boundary,
-                                            m_block_idx, n_block_idx, store_empty_mbar);
+      if (params.out_finalize != nullptr) {
+        sm120_common::utils::epi_pred_stg_finalize<KT>(params, accum, thread_idx, m_offset,
+                                                       m_boundary, m_block_idx, n_block_idx,
+                                                       store_empty_mbar);
+      } else {
+        sm120_common::utils::epi_pred_stg<KT>(params, accum, thread_idx, m_offset, m_boundary,
+                                              m_block_idx, n_block_idx, store_empty_mbar);
+      }
     } else {
       sm120_common::utils::epi_pred_r2g<KT>(params, shared_storage, accum, thread_idx, m_offset,
                                             m_boundary, m_block_idx, n_block_idx, expert_idx,
