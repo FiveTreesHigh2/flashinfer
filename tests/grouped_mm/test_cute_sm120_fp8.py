@@ -190,6 +190,105 @@ def test_moe_gemm_fp8_nt_groupwise_many_experts_sparse(active_rows, is_gated):
     assert diff < threshold, f"calc_diff={diff:.6e}"
 
 
+def _make_finalize_routing(m_per_expert_list, num_tokens, pad_rows=0):
+    """Row-indexed finalize metadata: each packed row maps to a token with a
+    weight; optionally append -1 padded rows (CUDA-graph style)."""
+    total_rows = sum(m_per_expert_list)
+    gen = torch.Generator(device="cpu").manual_seed(7)
+    dst2token = torch.randint(
+        0, num_tokens, (total_rows,), generator=gen, dtype=torch.int32
+    )
+    row_weights = torch.rand(total_rows, generator=gen, dtype=torch.float32)
+    if pad_rows:
+        dst2token = torch.cat(
+            [dst2token, torch.full((pad_rows,), -1, dtype=torch.int32)]
+        )
+        row_weights = torch.cat([row_weights, torch.zeros(pad_rows)])
+    return dst2token.cuda(), row_weights.cuda()
+
+
+@pytest.mark.parametrize("pad_rows", [0], ids=["nopad"])
+def test_moe_gemm_fp8_nt_groupwise_finalize_matches_manual(pad_rows):
+    skip_if_not_sm120()
+    num_experts, num_tokens = 256, 4
+    active = {3: 1, 40: 1, 77: 1, 114: 1, 151: 1, 188: 1, 225: 1, 255: 1}
+    m_per_expert_list = [active.get(i, 0) for i in range(num_experts)]
+    a, b, a_scale, b_scale, m_indptr, _ = make_inputs(m_per_expert_list, 1024, 2048)
+    dst2token, row_weights = _make_finalize_routing(m_per_expert_list, num_tokens)
+
+    packed = moe_gemm_fp8_nt_groupwise(a, b, a_scale, b_scale, m_indptr)
+    expected = torch.zeros(
+        (num_tokens, packed.shape[1]), dtype=torch.float32, device="cuda"
+    )
+    for row in range(packed.shape[0]):
+        token = int(dst2token[row].item())
+        expected[token] += packed[row].float() * float(row_weights[row].item())
+
+    finalize_out = torch.zeros_like(expected)
+    result = moe_gemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indptr,
+        finalize_out=finalize_out,
+        finalize_dst2token=dst2token,
+        finalize_row_weights=row_weights,
+    )
+    assert result.data_ptr() == finalize_out.data_ptr()
+    # The fused path combines pre-bf16-rounding accumulator values while the
+    # manual reference reads the rounded packed output; bf16 rounding bounds
+    # the gap.
+    diff = calc_diff(result, expected)
+    assert diff < CALC_DIFF_THRESHOLD, f"finalize calc_diff={diff:.6e}"
+
+
+def test_moe_gemm_fp8_nt_groupwise_finalize_skips_negative_rows():
+    skip_if_not_sm120()
+    num_experts, num_tokens = 8, 2
+    m_per_expert_list = [1, 0, 2, 0, 1, 0, 0, 4]
+    a, b, a_scale, b_scale, m_indptr, _ = make_inputs(m_per_expert_list, 1024, 2048)
+    total_rows = sum(m_per_expert_list)
+    dst2token = torch.full((total_rows,), -1, dtype=torch.int32, device="cuda")
+    row_weights = torch.ones(total_rows, dtype=torch.float32, device="cuda")
+
+    finalize_out = torch.zeros((num_tokens, 1024), dtype=torch.float32, device="cuda")
+    moe_gemm_fp8_nt_groupwise(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        m_indptr,
+        finalize_out=finalize_out,
+        finalize_dst2token=dst2token,
+        finalize_row_weights=row_weights,
+    )
+    assert torch.all(finalize_out == 0)
+
+
+def test_moe_gemm_fp8_nt_groupwise_finalize_rejects_non_swapab():
+    skip_if_not_sm120()
+    # 8 experts x 192 rows each -> m_per_expert 192 selects a flat tile path,
+    # which must refuse the finalize fusion loudly.
+    m_per_expert_list = [192] * 8
+    a, b, a_scale, b_scale, m_indptr, _ = make_inputs(m_per_expert_list, 4096, 7168)
+    total_rows = sum(m_per_expert_list)
+    dst2token = torch.zeros(total_rows, dtype=torch.int32, device="cuda")
+    row_weights = torch.ones(total_rows, dtype=torch.float32, device="cuda")
+    finalize_out = torch.zeros((4, 4096), dtype=torch.float32, device="cuda")
+    with pytest.raises(Exception, match="SwapAB"):
+        moe_gemm_fp8_nt_groupwise(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            m_indptr,
+            finalize_out=finalize_out,
+            finalize_dst2token=dst2token,
+            finalize_row_weights=row_weights,
+        )
+
+
 @pytest.mark.parametrize(
     "bad_input",
     [

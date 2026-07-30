@@ -23,7 +23,9 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
                                      TensorView b_scale, TensorView m_indptr, TensorView out,
                                      std::string scale_major_mode, int64_t scale_granularity_m,
                                      int64_t scale_granularity_n, int64_t scale_granularity_k,
-                                     int64_t is_gated) {
+                                     int64_t is_gated, Optional<TensorView> finalize_out,
+                                     Optional<TensorView> finalize_dst2token,
+                                     Optional<TensorView> finalize_row_weights) {
   TVM_FFI_ICHECK(scale_major_mode == "MN")
       << "Only scale_major_mode=\"MN\" is supported; got \"" << scale_major_mode << "\"";
 
@@ -74,14 +76,24 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   }
   int out_n = gated ? n / 2 : n;
 
+  bool has_finalize = finalize_out.has_value();
+  TVM_FFI_ICHECK(finalize_dst2token.has_value() == has_finalize &&
+                 finalize_row_weights.has_value() == has_finalize)
+      << "finalize_out, finalize_dst2token and finalize_row_weights must be "
+         "provided together";
+  TVM_FFI_ICHECK(!(has_finalize && gated))
+      << "finalize fusion is not supported together with is_gated";
+
   TVM_FFI_ICHECK_GT(num_experts, 0) << "num_experts must be positive; got " << num_experts;
   TVM_FFI_ICHECK_EQ(a.size(1), k) << "a.size(1) (" << a.size(1) << ") must match b.size(2) (" << k
                                   << ")";
-  TVM_FFI_ICHECK_EQ(out.size(0), total_rows)
-      << "out.size(0) (" << out.size(0) << ") must match a.size(0) (" << total_rows << ")";
-  TVM_FFI_ICHECK_EQ(out.size(1), out_n)
-      << "out.size(1) (" << out.size(1) << ") must match output N (" << out_n
-      << (gated ? "; = b.size(1)/2 for gated" : "; = b.size(1)") << ")";
+  if (!has_finalize) {
+    TVM_FFI_ICHECK_EQ(out.size(0), total_rows)
+        << "out.size(0) (" << out.size(0) << ") must match a.size(0) (" << total_rows << ")";
+    TVM_FFI_ICHECK_EQ(out.size(1), out_n)
+        << "out.size(1) (" << out.size(1) << ") must match output N (" << out_n
+        << (gated ? "; = b.size(1)/2 for gated" : "; = b.size(1)") << ")";
+  }
   TVM_FFI_ICHECK_EQ(m_indptr.size(0), num_experts + 1)
       << "m_indptr.size(0) (" << m_indptr.size(0) << ") must be num_experts + 1 ("
       << (num_experts + 1) << ")";
@@ -116,6 +128,35 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
   ffi::CUDADeviceGuard device_guard(a.device().device_id);
   auto stream = get_stream(a.device());
 
+  float* finalize_out_ptr = nullptr;
+  int32_t const* finalize_dst2token_ptr = nullptr;
+  float const* finalize_row_weights_ptr = nullptr;
+  if (has_finalize) {
+    TensorView fo = finalize_out.value();
+    TensorView dt = finalize_dst2token.value();
+    TensorView rw = finalize_row_weights.value();
+    CHECK_INPUT_AND_TYPE(fo, dl_float32);
+    CHECK_INPUT_AND_TYPE(dt, dl_int32);
+    CHECK_INPUT_AND_TYPE(rw, dl_float32);
+    CHECK_DEVICE(a, fo);
+    CHECK_DEVICE(a, dt);
+    CHECK_DEVICE(a, rw);
+    CHECK_DIM(2, fo);
+    CHECK_DIM(1, dt);
+    CHECK_DIM(1, rw);
+    TVM_FFI_ICHECK_EQ(fo.size(1), out_n)
+        << "finalize_out.size(1) (" << fo.size(1) << ") must match output N (" << out_n << ")";
+    TVM_FFI_ICHECK_EQ(dt.size(0), total_rows)
+        << "finalize_dst2token.size(0) (" << dt.size(0) << ") must match a.size(0) ("
+        << total_rows << ")";
+    TVM_FFI_ICHECK_EQ(rw.size(0), total_rows)
+        << "finalize_row_weights.size(0) (" << rw.size(0) << ") must match a.size(0) ("
+        << total_rows << ")";
+    finalize_out_ptr = static_cast<float*>(fo.data_ptr());
+    finalize_dst2token_ptr = static_cast<int32_t const*>(dt.data_ptr());
+    finalize_row_weights_ptr = static_cast<float const*>(rw.data_ptr());
+  }
+
   flashinfer::gemm::mxfp8_cute_sm120::CuteSm120Fp8GemmRunner<cute::float_e4m3_t, cute::bfloat16_t,
                                                              float, float>
       runner;
@@ -125,5 +166,6 @@ void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_sc
       static_cast<void const*>(b.data_ptr()), static_cast<int32_t const*>(m_indptr.data_ptr()),
       num_experts, total_rows, out_n, k, stream, static_cast<float const*>(a_scale.data_ptr()),
       static_cast<float const*>(b_scale.data_ptr()), static_cast<int>(scale_granularity_m),
-      static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated);
+      static_cast<int>(scale_granularity_n), static_cast<int>(scale_granularity_k), gated,
+      finalize_out_ptr, finalize_dst2token_ptr, finalize_row_weights_ptr);
 }

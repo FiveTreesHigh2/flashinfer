@@ -86,6 +86,9 @@ def moe_gemm_fp8_nt_groupwise(
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
     is_gated: bool = False,
+    finalize_out: Optional[torch.Tensor] = None,
+    finalize_dst2token: Optional[torch.Tensor] = None,
+    finalize_row_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     r"""Perform grouped GEMM with FP8 inputs in zero-padding mode using groupwise
     float32 scaling. Currently only supported on NVIDIA RTX PRO 6000 Blackwell (SM120)
@@ -148,6 +151,15 @@ def moe_gemm_fp8_nt_groupwise(
         (``b.shape[1] == 2 * out_n``) and the kernel fuses ``SiLU(gate) * up`` so the output
         N is ``b.shape[1] // 2``. Defaults to ``False`` (plain grouped GEMM).
 
+    finalize_out: Optional[torch.Tensor]
+        FINALIZE fusion (SwapAB tile path only, mutually exclusive with ``is_gated``):
+        zero-initialized float32 accumulator ``(num_tokens, n)``. When given together
+        with ``finalize_dst2token`` (int32 ``(cum_m,)``, ``-1`` rows skipped) and
+        ``finalize_row_weights`` (float32 ``(cum_m,)``), the epilogue adds each packed
+        row (scaled by its weight) into ``finalize_out[dst2token[row]]`` instead of
+        writing the packed output, replacing the separate unpermute+combine kernel.
+        The function then returns ``finalize_out``.
+
     Returns
     -------
     out: torch.Tensor
@@ -182,7 +194,25 @@ def moe_gemm_fp8_nt_groupwise(
     # (b.shape[1] == 2 * out_n); the kernel fuses SiLU(gate)*up so the output N is halved.
     n = b.shape[1]
     out_n = n // 2 if is_gated else n
-    if out is None:
+
+    finalize_args = (finalize_out, finalize_dst2token, finalize_row_weights)
+    use_finalize = finalize_out is not None
+    if any(t is not None for t in finalize_args) and not all(
+        t is not None for t in finalize_args
+    ):
+        raise ValueError(
+            "finalize_out, finalize_dst2token and finalize_row_weights must be "
+            "provided together"
+        )
+    if use_finalize:
+        if is_gated:
+            raise ValueError("finalize fusion is not supported together with is_gated")
+        if out is not None:
+            raise ValueError("out must not be given in finalize mode; the result is finalize_out")
+        # The packed bf16 output is unused in finalize mode; the op still takes
+        # the positional, so hand it a minimal dummy.
+        out = torch.empty((0, out_n), dtype=out_dtype, device=a.device)
+    elif out is None:
         out = torch.empty((a.shape[0], out_n), dtype=out_dtype, device=a.device)
 
     get_gemm_sm120_module_cute_fp8().moe_gemm_fp8_nt_groupwise(
@@ -197,5 +227,8 @@ def moe_gemm_fp8_nt_groupwise(
         scale_granularity_mnk[1],
         scale_granularity_mnk[2],
         is_gated,
+        finalize_out,
+        finalize_dst2token,
+        finalize_row_weights,
     )
-    return out
+    return finalize_out if use_finalize else out
