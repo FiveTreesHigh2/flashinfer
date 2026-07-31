@@ -17,6 +17,8 @@
 
 #include "tvm_ffi_utils.h"
 
+using tvm::ffi::Optional;
+
 void CutlassFP8GroupwiseMoeGEMMSM120(TensorView a, TensorView b, TensorView a_scale,
                                      TensorView b_scale, TensorView m_indptr, TensorView out,
                                      std::string scale_major_mode, int64_t scale_granularity_m,
